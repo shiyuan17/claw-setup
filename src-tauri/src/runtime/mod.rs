@@ -98,7 +98,7 @@ fn resolve_resources_dir(target_id: &str) -> PathBuf {
     }
 
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
+        .join("..")
         .join("resources")
         .join("targets")
         .join(target_id)

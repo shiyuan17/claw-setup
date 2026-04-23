@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1421",
     "build": "vite build",
-    "package:resources": "cd .. && npm run package:resources",
+    "package:resources": "node scripts/run-with-env.js node scripts/package-resources.js",
     "tauri:dev": "tauri dev",
     "tauri:build": "npm run package:resources && npm run build && tauri build",
     "tauri:build:debug": "npm run package:resources && npm run build && tauri build --debug",
@@ -19,5 +19,12 @@
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",
     "vite": "^7.0.0"
+  },
+  "oneclaw": {
+    "openclaw": "2026.4.5",
+    "dingtalkConnector": "0.8.13",
+    "weixin": "2.1.8",
+    "wecom": "2026.4.8",
+    "qqbot": "1.6.1"
   }
 }
