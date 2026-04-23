@@ -98,8 +98,6 @@ pub fn save_setup_config(params: &SaveConfigParams) -> Result<()> {
             provider_config["apiKey"] = Value::String("proxy-managed".to_string());
             provider_config["baseUrl"] =
                 Value::String(format!("http://127.0.0.1:{proxy_port}/coding"));
-            save_kimi_search_config(&mut config, proxy_port);
-            ensure_memory_search_proxy_config(&mut config, proxy_port);
         }
 
         config["models"]["providers"][provider_key.as_str()] = provider_config;
@@ -139,6 +137,8 @@ pub fn save_setup_config(params: &SaveConfigParams) -> Result<()> {
 
     ensure_object_path(&mut config, &["tools"]);
     config["tools"]["profile"] = Value::String("full".to_string());
+
+    remove_unbundled_kimi_features(&mut config);
 
     if let Some(object) = config.as_object_mut() {
         object.remove("wizard");
@@ -312,26 +312,23 @@ fn ensure_kimi_proxy_for_setup(api_key: &str) -> Result<u16> {
     Ok(proxy_port)
 }
 
-fn save_kimi_search_config(config: &mut Value, proxy_port: u16) {
-    ensure_object_path(config, &["plugins", "entries", "kimi-search"]);
-    config["plugins"]["entries"]["kimi-search"]["enabled"] = Value::Bool(true);
-    ensure_object_path(config, &["plugins", "entries", "kimi-search", "config"]);
-    config["plugins"]["entries"]["kimi-search"]["config"]["search"] =
-        json!({ "baseUrl": format!("http://127.0.0.1:{proxy_port}/coding/v1/search") });
-    config["plugins"]["entries"]["kimi-search"]["config"]["fetch"] =
-        json!({ "baseUrl": format!("http://127.0.0.1:{proxy_port}/coding/v1/fetch") });
-}
+fn remove_unbundled_kimi_features(config: &mut Value) {
+    if let Some(entries) = config
+        .get_mut("plugins")
+        .and_then(|value| value.get_mut("entries"))
+        .and_then(|value| value.as_object_mut())
+    {
+        entries.remove("kimi-claw");
+        entries.remove("kimi-search");
+    }
 
-fn ensure_memory_search_proxy_config(config: &mut Value, proxy_port: u16) {
-    ensure_object_path(config, &["agents", "defaults", "memorySearch"]);
-    config["agents"]["defaults"]["memorySearch"]["enabled"] = Value::Bool(true);
-    config["agents"]["defaults"]["memorySearch"]["provider"] = Value::String("openai".to_string());
-    config["agents"]["defaults"]["memorySearch"]["model"] = Value::String("bge_m3_embed".to_string());
-    ensure_object_path(config, &["agents", "defaults", "memorySearch", "remote"]);
-    config["agents"]["defaults"]["memorySearch"]["remote"]["baseUrl"] =
-        Value::String(format!("http://127.0.0.1:{proxy_port}/coding/v1/"));
-    config["agents"]["defaults"]["memorySearch"]["remote"]["apiKey"] =
-        Value::String("proxy-managed".to_string());
+    if let Some(defaults) = config
+        .get_mut("agents")
+        .and_then(|value| value.get_mut("defaults"))
+        .and_then(|value| value.as_object_mut())
+    {
+        defaults.remove("memorySearch");
+    }
 }
 
 fn backup_current_user_config() -> Result<()> {
@@ -524,6 +521,29 @@ mod tests {
     #[serial(openclaw_env)]
     fn save_setup_config_for_kimi_code_writes_proxy_managed_provider_and_sidecars() {
         let (_dir, _guard) = temp_state();
+        fs::create_dir_all(state_dir()).unwrap();
+        fs::write(
+            user_config_path(),
+            serde_json::to_string_pretty(&json!({
+                "plugins": {
+                    "entries": {
+                        "kimi-claw": { "enabled": true },
+                        "kimi-search": { "enabled": true }
+                    }
+                },
+                "agents": {
+                    "defaults": {
+                        "memorySearch": {
+                            "enabled": true,
+                            "remote": { "apiKey": "legacy" }
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
         save_setup_config(&SaveConfigParams {
             provider: "moonshot".to_string(),
             api_key: "kimi-manual-key".to_string(),
@@ -544,11 +564,9 @@ mod tests {
         assert!(base_url.starts_with("http://127.0.0.1:"));
         assert!(base_url.ends_with("/coding"));
         assert_eq!(config["models"]["providers"]["kimi-coding"]["apiKey"], "proxy-managed");
-        assert_eq!(config["plugins"]["entries"]["kimi-search"]["enabled"], true);
-        assert_eq!(
-            config["agents"]["defaults"]["memorySearch"]["remote"]["apiKey"],
-            "proxy-managed"
-        );
+        assert!(config["plugins"]["entries"].get("kimi-claw").is_none());
+        assert!(config["plugins"]["entries"].get("kimi-search").is_none());
+        assert!(config["agents"]["defaults"].get("memorySearch").is_none());
         assert_eq!(
             fs::read_to_string(state_dir().join("credentials").join("kimi-api-key")).unwrap(),
             "kimi-manual-key"

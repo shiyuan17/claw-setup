@@ -305,55 +305,24 @@ fn ensure_proxy_config(config: &mut serde_json::Value, proxy_port: u16) -> Resul
         provider.insert("apiKey".to_string(), serde_json::Value::String("proxy-managed".to_string()));
     }
 
-    ensure_memory_search_proxy_config(config, proxy_port);
-    if let Some(search_entry) = config
+    if let Some(entries) = config
         .get_mut("plugins")
         .and_then(|value| value.get_mut("entries"))
-        .and_then(|value| value.get_mut("kimi-search"))
         .and_then(|value| value.as_object_mut())
     {
-        let config_entry = search_entry
-            .entry("config")
-            .or_insert_with(|| serde_json::json!({}));
-        if !config_entry.is_object() {
-            *config_entry = serde_json::json!({});
-        }
-        config_entry["search"] =
-            serde_json::json!({ "baseUrl": format!("http://127.0.0.1:{proxy_port}/coding/v1/search") });
-        config_entry["fetch"] =
-            serde_json::json!({ "baseUrl": format!("http://127.0.0.1:{proxy_port}/coding/v1/fetch") });
+        entries.remove("kimi-claw");
+        entries.remove("kimi-search");
+    }
+
+    if let Some(defaults) = config
+        .get_mut("agents")
+        .and_then(|value| value.get_mut("defaults"))
+        .and_then(|value| value.as_object_mut())
+    {
+        defaults.remove("memorySearch");
     }
 
     config::write_user_config(config)
-}
-
-fn ensure_memory_search_proxy_config(config: &mut serde_json::Value, proxy_port: u16) {
-    ensure_object_path(config, &["agents", "defaults", "memorySearch"]);
-    config["agents"]["defaults"]["memorySearch"]["enabled"] = serde_json::Value::Bool(true);
-    config["agents"]["defaults"]["memorySearch"]["provider"] = serde_json::Value::String("openai".to_string());
-    config["agents"]["defaults"]["memorySearch"]["model"] = serde_json::Value::String("bge_m3_embed".to_string());
-    ensure_object_path(config, &["agents", "defaults", "memorySearch", "remote"]);
-    config["agents"]["defaults"]["memorySearch"]["remote"]["baseUrl"] =
-        serde_json::Value::String(format!("http://127.0.0.1:{proxy_port}/coding/v1/"));
-    config["agents"]["defaults"]["memorySearch"]["remote"]["apiKey"] =
-        serde_json::Value::String("proxy-managed".to_string());
-}
-
-fn ensure_object_path<'a>(root: &'a mut serde_json::Value, path: &[&str]) -> &'a mut serde_json::Map<String, serde_json::Value> {
-    if !root.is_object() {
-        *root = serde_json::json!({});
-    }
-    let mut current = root;
-    for key in path {
-        let object = current.as_object_mut().expect("object ensured");
-        current = object
-            .entry((*key).to_string())
-            .or_insert_with(|| serde_json::json!({}));
-        if !current.is_object() {
-            *current = serde_json::json!({});
-        }
-    }
-    current.as_object_mut().expect("object ensured")
 }
 
 fn parse_local_port(base_url: &str) -> Option<u16> {

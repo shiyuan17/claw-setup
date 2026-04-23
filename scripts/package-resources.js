@@ -21,11 +21,7 @@ const {
 // ─── 项目根目录 ───
 const ROOT = path.resolve(__dirname, "..");
 const TARGETS_ROOT = path.join(ROOT, "resources", "targets");
-const KIMI_CLAW_BASE_URL = "https://cdn.kimi.com/kimi-claw";
-const KIMI_CLAW_DEFAULT_TGZ_URL = `${KIMI_CLAW_BASE_URL}/kimi-claw-latest.tgz`;
-const KIMI_CLAW_CACHE_FILE = "kimi-claw-latest.tgz";
-const KIMI_SEARCH_DEFAULT_TGZ_URL = `${KIMI_CLAW_BASE_URL}/openclaw-kimi-search-0.1.2.tgz`;
-const KIMI_SEARCH_CACHE_FILE = "openclaw-kimi-search-0.1.2.tgz";
+const GATEWAY_RESOURCE_SCOPE = "claw-setup-openclaw-core-v2";
 const QQBOT_PACKAGE_NAME = "@sliverp/qqbot";
 const DINGTALK_CONNECTOR_PACKAGE_NAME = "@dingtalk-real-ai/dingtalk-connector";
 const WECOM_PLUGIN_PACKAGE_NAME = "@wecom/wecom-openclaw-plugin";
@@ -510,10 +506,9 @@ function buildAnalyticsConfig() {
 
 function writeBuildConfig(configPath) {
   const analytics = buildAnalyticsConfig();
-  const clawhubRegistry = readEnvText("ONECLAW_CLAWHUB_REGISTRY");
-  const config = { analytics, clawhubRegistry };
+  const config = { analytics };
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-  log(`已生成 build-config.json（analytics.enabled=${analytics.enabled ? "true" : "false"}, clawhubRegistry=${clawhubRegistry || "(空)"}）`);
+  log(`已生成 build-config.json（analytics.enabled=${analytics.enabled ? "true" : "false"}）`);
 }
 
 // ─── Step 2: 安装 openclaw 生产依赖 ───
@@ -855,11 +850,43 @@ function assertNativeDepsMatchTarget(nmDir, platform, arch) {
   }
 }
 
-// 安装 openclaw + clawhub 核心依赖（npm 插件由 bundleNpmPackagePlugin 独立安装）
+function pruneStandaloneExcludedArtifacts(gatewayDir) {
+  const nmDir = path.join(gatewayDir, "node_modules");
+  if (!fs.existsSync(nmDir)) return;
+
+  const removed = [];
+  const clawhubDir = path.join(nmDir, "clawhub");
+  if (fs.existsSync(clawhubDir)) {
+    rmDir(clawhubDir);
+    removed.push("clawhub");
+  }
+
+  const excludedExtensions = ["kimi-claw", "kimi-search"];
+  for (const baseDir of [
+    path.join(nmDir, "openclaw", "extensions"),
+    path.join(nmDir, "openclaw", "dist", "extensions"),
+  ]) {
+    if (!fs.existsSync(baseDir)) continue;
+    for (const extensionId of excludedExtensions) {
+      const extensionDir = path.join(baseDir, extensionId);
+      if (!fs.existsSync(extensionDir)) continue;
+      rmDir(extensionDir);
+      removed.push(`extension:${extensionId}`);
+    }
+  }
+
+  pruneDanglingBinLinks(nmDir);
+
+  if (removed.length > 0) {
+    log(`已移除 claw-setup 独立版不打包资源: ${removed.join(", ")}`);
+  }
+}
+
+// 安装 openclaw 核心依赖（npm 插件由 bundleNpmPackagePlugin 独立安装）
 function installDependencies(opts, gatewayDir) {
   const stampPath = path.join(gatewayDir, ".gateway-stamp");
   const sourceInfo = getPackageSource();
-  const targetStamp = `${opts.platform}-${opts.arch}|${sourceInfo.stampSource}`;
+  const targetStamp = `${opts.platform}-${opts.arch}|${sourceInfo.stampSource}|${GATEWAY_RESOURCE_SCOPE}`;
 
   // 增量检测：stamp 匹配 + entry.js 存在 → 跳过安装
   const installedEntry = path.join(gatewayDir, "node_modules", "openclaw", "dist", "entry.js");
@@ -874,6 +901,7 @@ function installDependencies(opts, gatewayDir) {
     pruneDanglingBinLinks(nmDir);
     assertNativeDepsMatchTarget(nmDir, opts.platform, opts.arch);
     patchWindowsOpenclawArtifacts(gatewayDir, opts.platform);
+    pruneStandaloneExcludedArtifacts(gatewayDir);
     return;
   }
 
@@ -889,11 +917,10 @@ function installDependencies(opts, gatewayDir) {
   const source = sourceInfo.source;
   log(`安装 openclaw 依赖 (来源: ${source}) ...`);
 
-  // 只安装 openclaw + clawhub 核心依赖（npm 插件独立安装，避免 peerDep 传染）
+  // 只安装 openclaw 核心依赖（npm 插件独立安装，避免 peerDep 传染）
   const pkg = {
     dependencies: {
       openclaw: source,
-      clawhub: "latest",
     },
   };
   fs.writeFileSync(path.join(gatewayDir, "package.json"), JSON.stringify(pkg, null, 2));
@@ -923,11 +950,12 @@ function installDependencies(opts, gatewayDir) {
   pruneDanglingBinLinks(nmDir);
   assertNativeDepsMatchTarget(nmDir, opts.platform, opts.arch);
   patchWindowsOpenclawArtifacts(gatewayDir, opts.platform);
+  pruneStandaloneExcludedArtifacts(gatewayDir);
   fs.writeFileSync(stampPath, targetStamp);
   log("node_modules 裁剪完成");
 }
 
-// Windows 上给 openclaw + kimi-claw 所有 spawn 调用统一补 windowsHide，避免黑框闪烁。
+// Windows 上给 openclaw 核心与已打入渠道插件的 spawn 调用统一补 windowsHide，避免黑框闪烁。
 // 采用全局扫描策略，不再逐文件 whack-a-mole，确保上游新增 spawn 调用自动被覆盖。
 function patchWindowsOpenclawArtifacts(gatewayDir, platform = "win32") {
   if (platform !== "win32") return;
@@ -941,14 +969,6 @@ function patchWindowsOpenclawArtifacts(gatewayDir, platform = "win32") {
     die(`openclaw dist 目录不存在，无法应用 Windows 补丁: ${distDir}`);
   }
   scanDirs.push(distDir);
-
-  // kimi-claw 插件（terminal-session-manager 有 pipe 回退未加 windowsHide）
-  const kimiClawDist = path.join(
-    gatewayDir, "node_modules", "openclaw", "dist", "extensions", "kimi-claw", "dist"
-  );
-  if (fs.existsSync(kimiClawDist)) {
-    scanDirs.push(kimiClawDist);
-  }
 
   let totalFiles = 0;
   let totalPatched = 0;
@@ -1008,7 +1028,7 @@ function injectWindowsHideAll(source) {
   //   ], { stdio  — 数组参数后的 options（killProcessTree, exec 等）
   //   ), { stdio  — 函数调用结果后的 options（slice(1) 等）
   //   var, { stdio — 变量参数后的 options（spawn(cmd, args, { stdio...）
-  //   [], { cwd   — 空数组后的 options（kimi-claw terminal）
+  //   [], { cwd   — 空数组后的 options
   return source.replace(
     /([)\]\w"']\s*,\s*\{)(\s*)(stdio|detached|cwd\b|env\s*[,:{])/g,
     (match, prefix, ws, keyword, offset) => {
@@ -1108,30 +1128,10 @@ function patchAsarBoundaryCheck(gatewayDir) {
   }
 }
 
-// ─── Step 2.5: 注入 bundled 插件（kimi-claw + kimi-search + qqbot + dingtalk） ───
+// ─── Step 2.5: 注入 bundled 渠道插件（qqbot + dingtalk + wecom + weixin） ───
 
 // 插件定义（id → 下载/缓存参数）
 const BUNDLED_PLUGINS = [
-  {
-    id: "kimi-claw",
-    localEnv: "ONECLAW_KIMI_CLAW_TGZ_PATH",
-    urlEnv: "ONECLAW_KIMI_CLAW_TGZ_URL",
-    refreshEnv: "ONECLAW_KIMI_CLAW_REFRESH",
-    defaultURL: KIMI_CLAW_DEFAULT_TGZ_URL,
-    cacheFile: KIMI_CLAW_CACHE_FILE,
-    // 校验解压产物必须包含的文件
-    requiredFiles: ["package.json", "openclaw.plugin.json"],
-    requiredFiles: ["package.json", "openclaw.plugin.json"],
-  },
-  {
-    id: "kimi-search",
-    localEnv: "ONECLAW_KIMI_SEARCH_TGZ_PATH",
-    urlEnv: "ONECLAW_KIMI_SEARCH_TGZ_URL",
-    refreshEnv: "ONECLAW_KIMI_SEARCH_REFRESH",
-    defaultURL: KIMI_SEARCH_DEFAULT_TGZ_URL,
-    cacheFile: KIMI_SEARCH_CACHE_FILE,
-    requiredFiles: ["package.json", "openclaw.plugin.json"],
-  },
   {
     id: "qqbot",
     packageName: QQBOT_PACKAGE_NAME,
@@ -1249,7 +1249,6 @@ function writeChannelEntryShim(plugin, pluginDir) {
 // openclaw/skills 只保留 OneClaw 产品需要的内置技能，上游新增 skill 不会自动打入。
 const OPENCLAW_SKILLS_ALLOWLIST = new Set([
   "canvas",
-  "clawhub",
   "coding-agent",
   "discord",
   "github",
@@ -1280,8 +1279,6 @@ const OPENCLAW_EXTENSION_ALLOWLIST = new Set([
   "feishu",
   "imessage",
   "telegram",
-  "kimi-claw",
-  "kimi-search",
   "qqbot",
   "dingtalk-connector",
   "wecom-openclaw-plugin",
@@ -1299,8 +1296,6 @@ const REQUIRED_OPENCLAW_BUNDLED_EXTENSIONS = [
 ];
 
 const REQUIRED_OPENCLAW_INJECTED_EXTENSIONS = [
-  path.join("kimi-claw", "openclaw.plugin.json"),
-  path.join("kimi-search", "openclaw.plugin.json"),
   path.join("qqbot", "openclaw.plugin.json"),
   path.join("dingtalk-connector", "openclaw.plugin.json"),
   path.join("wecom-openclaw-plugin", "openclaw.plugin.json"),
@@ -1703,26 +1698,10 @@ async function bundlePlugin(plugin, gatewayDir, targetId, opts) {
   log(`已注入 ${plugin.id} 插件到 ${path.relative(ROOT, pluginDir)}`);
 }
 
-// 是否 Windows arm64 交叉编译（x64 runner 无法为 arm64 编译 native addon）
-// macOS 交叉编译由 Apple Clang 支持，不视为受限场景
-function isWindowsArm64CrossCompile(opts) {
-  if (opts.platform !== "win32" || opts.arch !== "arm64") return false;
-  return process.arch !== "arm64";
-}
-
 // 注入所有 bundled 插件
 async function bundleAllPlugins(gatewayDir, targetId, opts) {
-  const winArm64Cross = isWindowsArm64CrossCompile(opts);
   for (const plugin of BUNDLED_PLUGINS) {
-    if (winArm64Cross) {
-      try {
-        await bundlePlugin(plugin, gatewayDir, targetId, opts);
-      } catch (err) {
-        log(`⚠ Windows arm64 交叉编译下插件 ${plugin.id} 注入失败，跳过: ${err.message || String(err)}`);
-      }
-    } else {
-      await bundlePlugin(plugin, gatewayDir, targetId, opts);
-    }
+    await bundlePlugin(plugin, gatewayDir, targetId, opts);
   }
 }
 
@@ -2054,6 +2033,7 @@ function verifyOutput(targetPaths, opts) {
 
   const platform = opts.platform;
   const nodeExe = platform === "darwin" ? "node" : "node.exe";
+  const npmExe = platform === "darwin" ? "npm" : "npm.cmd";
   const targetRel = path.relative(ROOT, targetPaths.targetBase);
 
   // macOS npm 在 vendor/npm/，Windows npm 在 node_modules/npm/
@@ -2065,6 +2045,7 @@ function verifyOutput(targetPaths, opts) {
   if (opts.asar) {
     const required = [
       path.join(targetRel, "runtime", nodeExe),
+      path.join(targetRel, "runtime", npmExe),
       npmDir,
       path.join(targetRel, "gateway.asar"),
       path.join(targetRel, "build-config.json"),
@@ -2087,19 +2068,15 @@ function verifyOutput(targetPaths, opts) {
 
   const required = [
     path.join(targetRel, "runtime", nodeExe),
+    path.join(targetRel, "runtime", npmExe),
     npmDir,
     path.join(targetRel, "gateway", "gateway-entry.mjs"),
     path.join(targetRel, "gateway", "node_modules", "openclaw", "openclaw.mjs"),
     path.join(targetRel, "gateway", "node_modules", "openclaw", "dist", "entry.js"),
     path.join(targetRel, "gateway", "node_modules", "openclaw", "dist", "control-ui", "index.html"),
-    path.join(targetRel, "gateway", "node_modules", "clawhub", "bin", "clawdhub.js"),
     path.join(targetRel, "build-config.json"),
     path.join(targetRel, "app-icon.png"),
   ];
-
-  // Windows arm64 交叉编译时含 native addon 的插件可能注入失败，校验时降级为 warning
-  const winArm64Cross = isWindowsArm64CrossCompile(opts);
-  const crossCompileOptionalExts = new Set(["kimi-claw", "kimi-search"]);
 
   // OneClaw 另行注入的插件始终在 dist/extensions/（单一路径）
   required.push(
@@ -2132,14 +2109,6 @@ function verifyOutput(targetPaths, opts) {
   for (const rel of required) {
     const abs = path.join(ROOT, rel);
     const exists = fs.existsSync(abs);
-
-    // Windows arm64 交叉编译时，可选扩展缺失只 warning
-    const isOptionalExt = winArm64Cross && [...crossCompileOptionalExts].some((ext) => rel.includes(`extensions${path.sep}${ext}`));
-    if (!exists && isOptionalExt) {
-      console.log(`  [跳过] ${rel} (Windows arm64 交叉编译，可选)`);
-      continue;
-    }
-
     const status = exists ? "OK" : "缺失";
     console.log(`  [${status}] ${rel}`);
     if (!exists) allOk = false;
@@ -2194,7 +2163,7 @@ async function main() {
 
   console.log();
 
-  // Step 2.5: 注入 bundled 插件（kimi-claw + kimi-search + qqbot + dingtalk）
+  // Step 2.5: 注入 bundled 渠道插件
   log("Step 2.5: 注入 bundled 插件");
   await bundleAllPlugins(targetPaths.gatewayDir, targetPaths.targetId, opts);
 
