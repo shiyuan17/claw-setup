@@ -26,9 +26,9 @@
     "active": true,
     "targets": "all",
     "icon": [
-      "../../assets/icon.png",
-      "../../assets/icon.icns",
-      "../../assets/icon.ico"
+      "../assets/icon.png",
+      "../assets/icon.icns",
+      "../assets/icon.ico"
     ]
   }
 }
