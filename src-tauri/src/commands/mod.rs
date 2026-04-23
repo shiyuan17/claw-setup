@@ -3,8 +3,10 @@ use serde_json::Value;
 
 use crate::config::{self, CompleteSetupParams, SaveConfigParams};
 use crate::daemon;
+use crate::logging;
 use crate::oauth;
 use crate::provider::{self, VerifyKeyParams};
+use crate::proxy;
 use crate::system::{self, ConflictParams};
 
 #[derive(Debug, Serialize)]
@@ -76,7 +78,20 @@ pub fn setup_get_launch_at_login() -> SetupResult<system::LaunchAtLoginState> {
 }
 
 #[tauri::command]
-pub fn verify_key(params: VerifyKeyParams) -> SetupResult<Value> {
+pub fn verify_key(mut params: VerifyKeyParams) -> SetupResult<Value> {
+    if params.provider == "moonshot" && params.sub_platform.as_deref() == Some("kimi-code") {
+        let Some(api_key) = params.api_key.as_deref().map(str::trim).filter(|value| !value.is_empty()) else {
+            return SetupResult::fail("API Key 不能为空");
+        };
+        match proxy::start_auth_proxy(params.proxy_port, Some(system::DEFAULT_PORT), api_key, oauth::load_search_dedicated_key()) {
+            Ok(port) => {
+                proxy::set_access_token(api_key.to_string());
+                params.proxy_port = Some(port);
+            }
+            Err(err) => return SetupResult::fail(err.to_string()),
+        }
+    }
+
     match provider::verify_provider(&params) {
         Ok(()) => SetupResult::empty_ok(),
         Err(err) => SetupResult::fail(provider::public_error(&err)),
@@ -93,11 +108,32 @@ pub fn save_config(params: SaveConfigParams) -> SetupResult<Value> {
 
 #[tauri::command]
 pub async fn complete_setup(params: Option<CompleteSetupParams>) -> SetupResult<Value> {
-    run_blocking(move || match config::complete_setup(params.as_ref()) {
-        Ok(token) => match daemon::ensure_daemon_running(&token) {
-            Ok(()) => SetupResult::empty_ok(),
-            Err(err) => SetupResult::fail(err.to_string()),
-        },
+    run_blocking(move || match config::prepare_setup_completion(params.as_ref()) {
+        Ok(token) => {
+            if let Some(launch_at_login) = params.as_ref().and_then(|value| value.launch_at_login) {
+                if let Err(err) = system::set_launch_at_login_enabled(launch_at_login) {
+                    logging::warn(format!("设置开机启动失败: {err}"));
+                }
+            }
+
+            if let Err(err) = daemon::ensure_daemon_running(&token) {
+                return SetupResult::fail(err.to_string());
+            }
+
+            if let Err(err) = config::finalize_setup_completion() {
+                return SetupResult::fail(err.to_string());
+            }
+
+            if params.as_ref().and_then(|value| value.install_cli).unwrap_or(true) {
+                if let Err(err) = system::install_cli_best_effort() {
+                    logging::warn(format!("CLI 安装失败: {err}"));
+                }
+            } else if let Err(err) = system::uninstall_cli_best_effort() {
+                logging::warn(format!("CLI 卸载失败: {err}"));
+            }
+
+            SetupResult::empty_ok()
+        }
         Err(err) => SetupResult::fail(err.to_string()),
     })
     .await

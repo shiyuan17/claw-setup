@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod config;
 pub mod daemon;
+pub mod logging;
 pub mod oauth;
 pub mod provider;
 pub mod proxy;

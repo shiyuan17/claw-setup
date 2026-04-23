@@ -295,11 +295,14 @@ pub fn build_verification_request(params: &VerifyKeyParams) -> Result<Verificati
         "moonshot" => {
             let sub = moonshot_sub_platform(params.sub_platform.as_deref());
             if params.sub_platform.as_deref() == Some("kimi-code") {
+                let proxy_port = params
+                    .proxy_port
+                    .filter(|port| *port > 0)
+                    .ok_or_else(|| anyhow!("Kimi Code auth proxy not running"))?;
                 Ok(VerificationRequest {
                     method: "POST".to_string(),
-                    url: format!("{}/v1/messages", sub.base_url),
+                    url: format!("http://127.0.0.1:{proxy_port}/coding/v1/messages"),
                     headers: headers([
-                        ("authorization", format!("Bearer {api_key}")),
                         ("anthropic-version", "2023-06-01".to_string()),
                         ("content-type", "application/json".to_string()),
                     ]),
@@ -506,13 +509,14 @@ mod tests {
     }
 
     #[test]
-    fn builds_kimi_code_direct_verification_request() {
+    fn builds_kimi_code_proxy_verification_request() {
         let mut params = params("moonshot");
         params.sub_platform = Some("kimi-code".to_string());
         params.model_id = Some("k2p5".to_string());
+        params.proxy_port = Some(18790);
         let request = build_verification_request(&params).unwrap();
-        assert_eq!(request.url, "https://api.kimi.com/coding/v1/messages");
-        assert_eq!(request.headers["authorization"], "Bearer sk-test");
+        assert_eq!(request.url, "http://127.0.0.1:18790/coding/v1/messages");
+        assert!(!request.headers.contains_key("authorization"));
     }
 
     #[test]

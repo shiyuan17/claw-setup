@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
 use std::net::TcpStream;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,15 +15,21 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::{Message, WebSocket};
 
 use crate::config;
+use crate::logging;
 use crate::oauth;
 use crate::proxy;
 use crate::runtime;
 use crate::system::{self, DEFAULT_PORT};
 
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(90);
+const HEALTH_TIMEOUT: Duration = if cfg!(windows) {
+    Duration::from_secs(180)
+} else {
+    Duration::from_secs(90)
+};
 const HEALTH_INTERVAL: Duration = Duration::from_millis(500);
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 const RPC_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_GATEWAY_START_ATTEMPTS: usize = 3;
 const TEST_SESSION_KEY: &str = "oneclaw-setup-smoke-test";
 const TEST_CHAT_PROMPT: &str = "请简短回复：OneClaw setup chat test ok";
 
@@ -60,7 +66,7 @@ pub fn ensure_daemon_running(token: &str) -> Result<()> {
     if probe_gateway(DEFAULT_PORT) {
         write_daemon_state(&DaemonState {
             daemon_pid: std::process::id(),
-            gateway_pid: 0,
+            gateway_pid: system::detect_port_pid(DEFAULT_PORT).unwrap_or(0),
             gateway_port: DEFAULT_PORT,
             proxy_port: None,
             started_at: Utc::now().to_rfc3339(),
@@ -141,29 +147,39 @@ pub fn run_daemon() -> Result<()> {
     let token = std::env::var("OPENCLAW_GATEWAY_TOKEN").unwrap_or_default();
     let token = if token.trim().is_empty() {
         let mut config = config::read_user_config();
-        config::ensure_gateway_auth_token_in_config(&mut config)
+        let token = config::ensure_gateway_auth_token_in_config(&mut config);
+        config::write_user_config(&config)?;
+        token
     } else {
         token
     };
 
+    logging::info("claw-setup daemon starting");
+    cleanup_before_gateway_start(&token);
     let proxy_port = ensure_auth_proxy()?;
-    let child = spawn_gateway(&token)?;
+    let mut child = spawn_gateway_with_retries(&token)?;
     write_daemon_state(&DaemonState {
         daemon_pid: std::process::id(),
-        gateway_pid: child,
+        gateway_pid: child.id(),
         gateway_port: DEFAULT_PORT,
         proxy_port,
         started_at: Utc::now().to_rfc3339(),
     })?;
-    wait_for_gateway(DEFAULT_PORT, HEALTH_TIMEOUT)?;
+    config::record_last_known_good_config_snapshot()?;
+    logging::info(format!("gateway running pid={}", child.id()));
     loop {
+        if let Some(status) = child.try_wait()? {
+            remove_daemon_state_file();
+            return Err(anyhow!("Gateway 已退出: {status}"));
+        }
         thread::sleep(Duration::from_secs(60));
     }
 }
 
-pub fn spawn_gateway(token: &str) -> Result<u32> {
+pub fn spawn_gateway(token: &str) -> Result<Child> {
     let layout = runtime::resolve_runtime_layout()?;
     runtime::validate_runtime_layout(&layout)?;
+    system::ensure_clawhub_wrapper(&layout)?;
 
     let log_path = config::state_dir().join("gateway.log");
     if let Some(parent) = log_path.parent() {
@@ -183,7 +199,7 @@ pub fn spawn_gateway(token: &str) -> Result<u32> {
         .stderr(Stdio::from(stderr))
         .spawn()
         .context("启动 openclaw gateway 失败")?;
-    Ok(child.id())
+    Ok(child)
 }
 
 fn ensure_auth_proxy() -> Result<Option<u16>> {
@@ -235,6 +251,46 @@ fn ensure_auth_proxy() -> Result<Option<u16>> {
     }
 
     Ok(Some(proxy_port))
+}
+
+fn cleanup_before_gateway_start(token: &str) {
+    system::remove_openclaw_lockfiles();
+    system::uninstall_gateway_daemon_best_effort();
+    if probe_gateway(DEFAULT_PORT) {
+        let _ = stop_gateway_via_cli(token);
+    }
+    if !wait_for_port_release(Duration::from_secs(5)) {
+        if let Some(pid) = system::detect_port_pid(DEFAULT_PORT) {
+            let _ = system::kill_pid_force(pid);
+            let _ = wait_for_port_release(Duration::from_secs(5));
+        }
+    }
+}
+
+fn spawn_gateway_with_retries(token: &str) -> Result<Child> {
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 1..=MAX_GATEWAY_START_ATTEMPTS {
+        if attempt > 1 {
+            logging::warn(format!("Gateway 启动重试 {attempt}/{MAX_GATEWAY_START_ATTEMPTS}"));
+            cleanup_before_gateway_start(token);
+        }
+        match spawn_gateway(token) {
+            Ok(mut child) => match wait_for_gateway_child(DEFAULT_PORT, HEALTH_TIMEOUT, &mut child) {
+                Ok(()) => return Ok(child),
+                Err(err) => {
+                    logging::error(format!("Gateway 第 {attempt} 次启动失败: {err}"));
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    last_error = Some(err);
+                }
+            },
+            Err(err) => {
+                logging::error(format!("Gateway 第 {attempt} 次 spawn 失败: {err}"));
+                last_error = Some(err);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("Gateway 启动失败")))
 }
 
 fn ensure_proxy_config(config: &mut serde_json::Value, proxy_port: u16) -> Result<()> {
@@ -313,6 +369,24 @@ pub fn wait_for_gateway(port: u16, timeout: Duration) -> Result<()> {
     while Instant::now() < deadline {
         if probe_gateway(port) {
             return Ok(());
+        }
+        thread::sleep(HEALTH_INTERVAL);
+    }
+    Err(anyhow!("Gateway 启动超时或失败，请稍后重试。"))
+}
+
+fn wait_for_gateway_child(port: u16, timeout: Duration, child: &mut Child) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait()? {
+            return Err(anyhow!("Gateway 进程提前退出: {status}"));
+        }
+        if probe_gateway(port) {
+            thread::sleep(Duration::from_millis(300));
+            if child.try_wait()?.is_none() {
+                return Ok(());
+            }
+            return Err(anyhow!("Gateway 健康检查通过后进程退出"));
         }
         thread::sleep(HEALTH_INTERVAL);
     }
@@ -568,15 +642,26 @@ fn apply_gateway_env(command: &mut Command, layout: &runtime::RuntimeLayout, tok
         .env("OPENCLAW_GATEWAY_TOKEN", token)
         .env("OPENCLAW_NPM_BIN", &layout.npm_bin)
         .env("PATH", build_env_path(layout)?);
+    if let Some(kimi_key) = resolve_kimi_plugin_api_key() {
+        command.env("KIMI_PLUGIN_API_KEY", kimi_key);
+    }
     Ok(())
+}
+
+fn resolve_kimi_plugin_api_key() -> Option<String> {
+    oauth::load_search_dedicated_key()
+        .or_else(|| oauth::load_token().map(|token| token.access_token))
+        .or_else(oauth::load_manual_kimi_api_key)
+        .or_else(|| proxy::get_port().map(|_| "proxy-managed".to_string()))
 }
 
 fn build_env_path(layout: &runtime::RuntimeLayout) -> Result<OsString> {
     let user_bin_dir = config::state_dir().join("bin");
     let runtime_dir = layout.resources_dir.join("runtime");
     let existing_path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::join_paths([user_bin_dir.as_os_str(), runtime_dir.as_os_str(), existing_path.as_os_str()])
-        .map_err(|err| anyhow!("构造 PATH 失败: {err}"))
+    let mut paths = vec![user_bin_dir, runtime_dir];
+    paths.extend(std::env::split_paths(&existing_path));
+    std::env::join_paths(paths).map_err(|err| anyhow!("构造 PATH 失败: {err}"))
 }
 
 fn rpc_id() -> String {
@@ -807,5 +892,25 @@ mod tests {
             })),
             Some("hi there".to_string())
         );
+    }
+
+    #[test]
+    #[serial(openclaw_env)]
+    fn builds_env_path_by_splitting_existing_path() {
+        let dir = TempDir::new().unwrap();
+        let _guard = EnvGuard::set(dir.path());
+        let layout = runtime::RuntimeLayout {
+            target_id: "darwin-arm64".to_string(),
+            resources_dir: dir.path().join("resources"),
+            node_bin: dir.path().join("resources/runtime/node"),
+            npm_bin: dir.path().join("resources/runtime/npm"),
+            gateway_entry: dir.path().join("gateway-entry.mjs"),
+            gateway_cwd: dir.path().to_path_buf(),
+            clawhub_entry: dir.path().join("clawdhub.js"),
+        };
+        let path = build_env_path(&layout).unwrap();
+        let parts = std::env::split_paths(&path).collect::<Vec<_>>();
+        assert_eq!(parts[0], dir.path().join("bin"));
+        assert_eq!(parts[1], dir.path().join("resources/runtime"));
     }
 }

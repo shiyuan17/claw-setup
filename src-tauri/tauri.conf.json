@@ -5,7 +5,7 @@
   "identifier": "cn.oneclaw.setup",
   "build": {
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run package:resources && npm run build",
     "devUrl": "http://127.0.0.1:1421",
     "frontendDist": "../dist"
   },
@@ -26,9 +26,12 @@
     "active": true,
     "targets": "all",
     "icon": [
-      "../assets/icon.png",
-      "../assets/icon.icns",
-      "../assets/icon.ico"
-    ]
+      "../../assets/icon.png",
+      "../../assets/icon.icns",
+      "../../assets/icon.ico"
+    ],
+    "resources": {
+      "../../resources/targets": "resources/targets"
+    }
   }
 }

@@ -7,8 +7,12 @@ use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
+use crate::oauth;
 use crate::provider::{self, SaveConfigParamsLike};
+use crate::proxy;
 use crate::system;
+
+const MAX_BACKUP_FILES: usize = 10;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,6 +59,10 @@ pub fn daemon_state_path() -> PathBuf {
     state_dir().join("claw-setup-daemon.json")
 }
 
+pub fn last_known_good_config_path() -> PathBuf {
+    state_dir().join("openclaw.last-known-good.json")
+}
+
 pub fn read_user_config() -> Value {
     read_json_file(&user_config_path()).unwrap_or_else(|| json!({}))
 }
@@ -75,15 +83,25 @@ pub fn save_setup_config(params: &SaveConfigParams) -> Result<()> {
     ensure_object_path(&mut config, &["models", "providers"]);
     ensure_object_path(&mut config, &["agents", "defaults", "model"]);
     ensure_object_path(&mut config, &["agents", "defaults", "compaction"]);
-
     config["agents"]["defaults"]["compaction"]["mode"] = Value::String("safeguard".to_string());
 
     if params.provider == "moonshot" {
-        let (provider_key, provider_config) = provider::build_moonshot_provider_config(
+        let (provider_key, mut provider_config) = provider::build_moonshot_provider_config(
             &params.api_key,
             &params.model_id,
             params.sub_platform.as_deref(),
         );
+
+        if params.sub_platform.as_deref() == Some("kimi-code") {
+            let proxy_port = ensure_kimi_proxy_for_setup(&params.api_key)?;
+            oauth::save_manual_kimi_api_key(&params.api_key)?;
+            provider_config["apiKey"] = Value::String("proxy-managed".to_string());
+            provider_config["baseUrl"] =
+                Value::String(format!("http://127.0.0.1:{proxy_port}/coding"));
+            save_kimi_search_config(&mut config, proxy_port);
+            ensure_memory_search_proxy_config(&mut config, proxy_port);
+        }
+
         config["models"]["providers"][provider_key.as_str()] = provider_config;
         config["agents"]["defaults"]["model"]["primary"] =
             Value::String(format!("{provider_key}/{}", params.model_id));
@@ -129,7 +147,7 @@ pub fn save_setup_config(params: &SaveConfigParams) -> Result<()> {
     write_user_config(&config)
 }
 
-pub fn complete_setup(params: Option<&CompleteSetupParams>) -> Result<String> {
+pub fn prepare_setup_completion(params: Option<&CompleteSetupParams>) -> Result<String> {
     let mut config = read_user_config();
     ensure_object(&mut config);
 
@@ -138,28 +156,23 @@ pub fn complete_setup(params: Option<&CompleteSetupParams>) -> Result<String> {
     config["hooks"]["internal"]["enabled"] = Value::Bool(true);
     config["hooks"]["internal"]["entries"]["session-memory"] = json!({ "enabled": session_memory });
 
+    let token = ensure_gateway_auth_token_in_config(&mut config);
+    write_user_config(&config)?;
+    Ok(token)
+}
+
+pub fn finalize_setup_completion() -> Result<()> {
+    let mut config = read_user_config();
+    ensure_object(&mut config);
     ensure_object_path(&mut config, &["wizard"]);
     config["wizard"]["lastRunAt"] = Value::String(Utc::now().to_rfc3339());
     if let Some(wizard) = config["wizard"].as_object_mut() {
         wizard.remove("pendingAt");
     }
-
-    let token = ensure_gateway_auth_token_in_config(&mut config);
     write_user_config(&config)?;
     mark_setup_complete()?;
     record_setup_baseline_config_snapshot()?;
-
-    if let Some(launch_at_login) = params.and_then(|value| value.launch_at_login) {
-        system::set_launch_at_login_enabled(launch_at_login)?;
-    }
-
-    if params.and_then(|value| value.install_cli).unwrap_or(true) {
-        system::install_cli_best_effort()?;
-    } else {
-        system::uninstall_cli_best_effort()?;
-    }
-
-    Ok(token)
+    Ok(())
 }
 
 pub fn ensure_gateway_auth_token_in_config(config: &mut Value) -> String {
@@ -225,8 +238,7 @@ pub fn mark_setup_complete() -> Result<()> {
 
 pub fn record_setup_baseline_config_snapshot() -> Result<()> {
     let config_path = user_config_path();
-    let raw = read_valid_json_raw(&config_path);
-    let Some(raw) = raw else {
+    let Some(raw) = read_valid_json_raw(&config_path) else {
         return Ok(());
     };
     let baseline_path = state_dir().join("openclaw-setup-baseline.json");
@@ -237,6 +249,24 @@ pub fn record_setup_baseline_config_snapshot() -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     fs::write(baseline_path, raw)?;
+    Ok(())
+}
+
+pub fn record_last_known_good_config_snapshot() -> Result<()> {
+    let config_path = user_config_path();
+    let Some(raw) = read_valid_json_raw(&config_path) else {
+        return Ok(());
+    };
+    let snapshot_path = last_known_good_config_path();
+    if let Some(parent) = snapshot_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if snapshot_path.exists()
+        && fs::read_to_string(&snapshot_path).ok().as_deref() == Some(raw.as_str())
+    {
+        return Ok(());
+    }
+    fs::write(snapshot_path, raw)?;
     Ok(())
 }
 
@@ -274,6 +304,36 @@ pub fn reset_config_health_baseline(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn ensure_kimi_proxy_for_setup(api_key: &str) -> Result<u16> {
+    let preferred = proxy::get_port();
+    let search_key = oauth::load_search_dedicated_key();
+    let proxy_port = proxy::start_auth_proxy(preferred, Some(system::DEFAULT_PORT), api_key, search_key)?;
+    proxy::set_access_token(api_key.to_string());
+    Ok(proxy_port)
+}
+
+fn save_kimi_search_config(config: &mut Value, proxy_port: u16) {
+    ensure_object_path(config, &["plugins", "entries", "kimi-search"]);
+    config["plugins"]["entries"]["kimi-search"]["enabled"] = Value::Bool(true);
+    ensure_object_path(config, &["plugins", "entries", "kimi-search", "config"]);
+    config["plugins"]["entries"]["kimi-search"]["config"]["search"] =
+        json!({ "baseUrl": format!("http://127.0.0.1:{proxy_port}/coding/v1/search") });
+    config["plugins"]["entries"]["kimi-search"]["config"]["fetch"] =
+        json!({ "baseUrl": format!("http://127.0.0.1:{proxy_port}/coding/v1/fetch") });
+}
+
+fn ensure_memory_search_proxy_config(config: &mut Value, proxy_port: u16) {
+    ensure_object_path(config, &["agents", "defaults", "memorySearch"]);
+    config["agents"]["defaults"]["memorySearch"]["enabled"] = Value::Bool(true);
+    config["agents"]["defaults"]["memorySearch"]["provider"] = Value::String("openai".to_string());
+    config["agents"]["defaults"]["memorySearch"]["model"] = Value::String("bge_m3_embed".to_string());
+    ensure_object_path(config, &["agents", "defaults", "memorySearch", "remote"]);
+    config["agents"]["defaults"]["memorySearch"]["remote"]["baseUrl"] =
+        Value::String(format!("http://127.0.0.1:{proxy_port}/coding/v1/"));
+    config["agents"]["defaults"]["memorySearch"]["remote"]["apiKey"] =
+        Value::String("proxy-managed".to_string());
+}
+
 fn backup_current_user_config() -> Result<()> {
     let path = user_config_path();
     let Some(raw) = read_valid_json_raw(&path) else {
@@ -281,9 +341,49 @@ fn backup_current_user_config() -> Result<()> {
     };
     let backup_dir = state_dir().join("config-backups");
     fs::create_dir_all(&backup_dir)?;
-    let file_name = format!("openclaw-{}.json", Utc::now().format("%Y%m%d-%H%M%S"));
+    let file_name = build_backup_file_name(&backup_dir);
     fs::write(backup_dir.join(file_name), raw)?;
+    prune_old_backups(&backup_dir)?;
     Ok(())
+}
+
+fn build_backup_file_name(backup_dir: &Path) -> String {
+    let stamp = Utc::now().format("%Y%m%d-%H%M%S");
+    let primary = format!("openclaw-{stamp}.json");
+    if !backup_dir.join(&primary).exists() {
+        return primary;
+    }
+    for index in 1..100 {
+        let candidate = format!("openclaw-{stamp}-{:02}.json", index);
+        if !backup_dir.join(&candidate).exists() {
+            return candidate;
+        }
+    }
+    format!("openclaw-{stamp}-{}.json", Utc::now().timestamp_millis())
+}
+
+fn prune_old_backups(backup_dir: &Path) -> Result<()> {
+    let mut files = fs::read_dir(backup_dir)?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().map(|kind| kind.is_file()).unwrap_or(false))
+        .filter(|entry| is_backup_file_name(&entry.file_name().to_string_lossy()))
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            Some((entry.path(), metadata.modified().ok()?))
+        })
+        .collect::<Vec<_>>();
+    if files.len() <= MAX_BACKUP_FILES {
+        return Ok(());
+    }
+    files.sort_by(|left, right| right.1.cmp(&left.1));
+    for (path, _) in files.into_iter().skip(MAX_BACKUP_FILES) {
+        let _ = fs::remove_file(path);
+    }
+    Ok(())
+}
+
+fn is_backup_file_name(name: &str) -> bool {
+    name.starts_with("openclaw-") && name.ends_with(".json")
 }
 
 fn read_json_file(path: &Path) -> Option<Value> {
@@ -390,7 +490,7 @@ mod tests {
         assert_eq!(config["agents"]["defaults"]["model"]["primary"], "openai/gpt-test");
         assert_eq!(config["gateway"]["auth"]["mode"], "token");
         assert_eq!(config["channels"]["imessage"]["enabled"], false);
-        assert!(user_config_path().with_extension("json.bak").exists() || PathBuf::from(format!("{}.bak", user_config_path().display())).exists());
+        assert!(PathBuf::from(format!("{}.bak", user_config_path().display())).exists());
     }
 
     #[test]
@@ -422,7 +522,42 @@ mod tests {
 
     #[test]
     #[serial(openclaw_env)]
-    fn complete_setup_marks_oneclaw_and_records_baseline() {
+    fn save_setup_config_for_kimi_code_writes_proxy_managed_provider_and_sidecars() {
+        let (_dir, _guard) = temp_state();
+        save_setup_config(&SaveConfigParams {
+            provider: "moonshot".to_string(),
+            api_key: "kimi-manual-key".to_string(),
+            model_id: "k2p5".to_string(),
+            base_url: None,
+            api: None,
+            sub_platform: Some("kimi-code".to_string()),
+            support_image: Some(true),
+            custom_preset: None,
+        })
+        .unwrap();
+
+        let config = read_user_config();
+        let base_url = config["models"]["providers"]["kimi-coding"]["baseUrl"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(base_url.starts_with("http://127.0.0.1:"));
+        assert!(base_url.ends_with("/coding"));
+        assert_eq!(config["models"]["providers"]["kimi-coding"]["apiKey"], "proxy-managed");
+        assert_eq!(config["plugins"]["entries"]["kimi-search"]["enabled"], true);
+        assert_eq!(
+            config["agents"]["defaults"]["memorySearch"]["remote"]["apiKey"],
+            "proxy-managed"
+        );
+        assert_eq!(
+            fs::read_to_string(state_dir().join("credentials").join("kimi-api-key")).unwrap(),
+            "kimi-manual-key"
+        );
+    }
+
+    #[test]
+    #[serial(openclaw_env)]
+    fn prepare_and_finalize_setup_write_completion_markers() {
         let (_dir, _guard) = temp_state();
         save_setup_config(&SaveConfigParams {
             provider: "anthropic".to_string(),
@@ -436,20 +571,33 @@ mod tests {
         })
         .unwrap();
 
-        let token = complete_setup(Some(&CompleteSetupParams {
+        let token = prepare_setup_completion(Some(&CompleteSetupParams {
             install_cli: Some(false),
             launch_at_login: None,
             session_memory: Some(true),
         }))
         .unwrap();
-
         assert!(!token.is_empty());
+        finalize_setup_completion().unwrap();
+
         let config = read_user_config();
         assert!(config["wizard"]["lastRunAt"].as_str().is_some());
         assert_eq!(config["hooks"]["internal"]["entries"]["session-memory"]["enabled"], true);
         let oneclaw = read_json_file(&oneclaw_config_path()).unwrap();
         assert!(oneclaw["setupCompletedAt"].as_str().is_some());
         assert!(state_dir().join("openclaw-setup-baseline.json").exists());
+    }
+
+    #[test]
+    #[serial(openclaw_env)]
+    fn write_user_config_creates_rolling_backup_from_valid_previous_json() {
+        let (_dir, _guard) = temp_state();
+        fs::create_dir_all(state_dir()).unwrap();
+        fs::write(user_config_path(), "{\"hello\":true}\n").unwrap();
+        write_user_config(&json!({"world": true})).unwrap();
+        let backup_dir = state_dir().join("config-backups");
+        assert!(backup_dir.exists());
+        assert_eq!(fs::read_dir(backup_dir).unwrap().count(), 1);
     }
 
     #[test]

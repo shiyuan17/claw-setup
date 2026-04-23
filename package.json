@@ -6,8 +6,10 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1421",
     "build": "vite build",
+    "package:resources": "cd .. && npm run package:resources",
     "tauri:dev": "tauri dev",
-    "tauri:build": "npm run build && tauri build",
+    "tauri:build": "npm run package:resources && npm run build && tauri build",
+    "tauri:build:debug": "npm run package:resources && npm run build && tauri build --debug",
     "test": "cargo test --manifest-path src-tauri/Cargo.toml",
     "clippy": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings"
   },
