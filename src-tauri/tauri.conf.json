@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "cn.oneclaw.setup",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run package:resources && npm run dev",
     "beforeBuildCommand": "npm run package:resources && npm run build",
     "devUrl": "http://127.0.0.1:1421",
     "frontendDist": "../dist"
